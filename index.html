@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,800;1,9..144,400&family=JetBrains+Mono:wght@400;500;700&family=Inter+Tight:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <style>
   :root {
     /* Navy / Light Blue / White palette */
@@ -2843,13 +2844,167 @@ function isLiveConfigured() {
   return SHEET_URL && !SHEET_URL.startsWith("PASTE_") && SHEET_URL.startsWith("http");
 }
 
+/* ============================================================
+   CSV PARSER for Google Sheets published CSV
+   Layout (0-indexed columns):
+     col 3   = Particulars (line label)
+     cols 4-15  = FY27 Actuals (Apr-26 .. Mar-27)
+     cols 18-29 = FY27 AOP (Apr-26 .. Mar-27)
+     col 30  = FY27 AOP Total
+     cols 33-44 = FY26 Actuals (Apr-25 .. Mar-26)
+     col 45  = FY26 Total
+   First 3 columns are empty padding from sheet formatting.
+   Data rows start after header rows (typically row 6 = index 5).
+   ============================================================ */
+function parseNum(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim().replace(/,/g, "").replace(/"/g, "");
+  if (s === "" || s === "#DIV/0!" || s === "#REF!" || s === "#N/A") return null;
+  const n = parseFloat(s);
+  return isNaN(n) ? null : n;
+}
+
+function parseLiveCSV(csvText) {
+  // Use Papa Parse if available, else manual parse
+  let rows;
+  if (typeof Papa !== "undefined") {
+    const parsed = Papa.parse(csvText, { header: false, skipEmptyLines: false });
+    rows = parsed.data;
+  } else {
+    rows = csvText.split(/\r?\n/).map(line => line.split(","));
+  }
+
+  // Find data start: the row whose col 3 is "Total Revenue"
+  let dataStartIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 20); i++) {
+    if (rows[i] && rows[i][3] && String(rows[i][3]).trim() === "Total Revenue") {
+      dataStartIdx = i;
+      break;
+    }
+  }
+  if (dataStartIdx === -1) throw new Error("Could not find 'Total Revenue' row in CSV. Check sheet structure.");
+
+  // Section/geography mapping based on label (since structural row numbers may shift)
+  // We walk rows in order and assign sections based on known anchor labels
+  const SECTION_ANCHORS = {
+    "Total Revenue": { section: "Revenue", geography: null },
+    "India":        { section: "Revenue", geography: "India" },
+    "International":{ section: "Revenue", geography: "International" },
+    "Direct Cost":  { section: "Direct Cost", geography: null },
+    "Gross Margin": { section: "Gross Margin", geography: null },
+    "Operating Cost":{ section: "Operating Cost", geography: null },
+    "Ebitda":       { section: "EBITDA", geography: null },
+    "Exception Item":{ section: "Exception", geography: null },
+    "Ebitda Post Exception Item": { section: "EBITDA Post Exception", geography: null }
+  };
+
+  const KNOWN_TOTALS = new Set([
+    "Total Revenue", "India", "International", "Direct Cost", "Gross Margin",
+    "Operating Cost", "Ebitda", "Ebitda Post Exception Item",
+    "Merchant Business", "Bank Business", "PA", "Networks & Jusbiz",
+    "Exception Item", "Hypercheckout", "Hypercredit", "Merchant UPI Acquiring",
+    "Consumer Issuer App", "Bank Acquirer & Issuance Business",
+    "Ebitda-India", "Ebitda-International"
+  ]);
+
+  const lines = [];
+  let currentSection = null;
+  let currentGeography = null;
+
+  for (let i = dataStartIdx; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || !row[3]) continue;
+    const label = String(row[3]).trim();
+    if (!label) continue;
+
+    // Check if this label is a section anchor
+    if (SECTION_ANCHORS[label]) {
+      currentSection = SECTION_ANCHORS[label].section;
+      // Geography only updates for India/International (revenue sub-anchors)
+      if (label === "India" || label === "International" || label === "Total Revenue") {
+        currentGeography = SECTION_ANCHORS[label].geography;
+      }
+    }
+
+    // Read values from fixed CSV column positions
+    const actuals = [];
+    for (let c = 4; c <= 15; c++) actuals.push(parseNum(row[c]));
+    const aop = [];
+    for (let c = 18; c <= 29; c++) aop.push(parseNum(row[c]));
+    const aop_total = parseNum(row[30]);
+    const py = [];
+    for (let c = 33; c <= 44; c++) py.push(parseNum(row[c]));
+    const py_total = parseNum(row[45]);
+
+    // Skip rows with no data anywhere
+    const hasAny = actuals.some(v => v !== null) || aop.some(v => v !== null) || py.some(v => v !== null) || aop_total !== null || py_total !== null;
+    if (!hasAny) continue;
+
+    const isCost = currentSection === "Direct Cost" || currentSection === "Operating Cost" || currentSection === "Exception";
+    const isPct = label.startsWith("%");
+
+    lines.push({
+      row: i + 1,
+      label: label,
+      section: currentSection,
+      geography: currentGeography,
+      is_total: KNOWN_TOTALS.has(label),
+      is_pct: isPct,
+      is_cost: isCost,
+      actuals: actuals,
+      aop: aop,
+      aop_total: aop_total,
+      py: py,
+      py_total: py_total
+    });
+  }
+
+  return {
+    meta: {
+      company: "Juspay Technologies India Pvt Ltd",
+      fy: "FY27",
+      currency: "INR",
+      unit: "Cr",
+      months: ["Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec","Jan","Feb","Mar"]
+    },
+    lines: lines
+  };
+}
+
+async function fetchLiveData() {
+  // Add cache-busting query param to bypass any browser/CDN cache
+  const url = SHEET_URL + (SHEET_URL.includes("?") ? "&" : "?") + "_=" + Date.now();
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("HTTP " + response.status + " fetching CSV. Check that the sheet is published correctly.");
+  const csvText = await response.text();
+  return parseLiveCSV(csvText);
+}
+
 async function loadData() {
   try {
-    DATA = EMBEDDED_MIS;
-    IND = EMBEDDED_INDCOH;
-    setLiveStatus(isLiveConfigured() ? "ok" : "demo", isLiveConfigured() ? "LIVE" : "DEMO DATA");
-    const lu = document.getElementById("lastUpdate");
-    if (lu) lu.textContent = isLiveConfigured() ? "Updated " + new Date().toLocaleTimeString("en-IN", {hour:"2-digit", minute:"2-digit"}) : "Embedded snapshot";
+    if (isLiveConfigured()) {
+      setLiveStatus("loading", "LOADING…");
+      try {
+        DATA = await fetchLiveData();
+        IND = EMBEDDED_INDCOH;  // Industry/Cohort still use embedded (not yet wired to live)
+        setLiveStatus("ok", "LIVE");
+        const lu = document.getElementById("lastUpdate");
+        if (lu) lu.textContent = "Updated " + new Date().toLocaleTimeString("en-IN", {hour:"2-digit", minute:"2-digit"});
+      } catch (fetchErr) {
+        console.error("Live fetch failed, falling back to embedded:", fetchErr);
+        DATA = EMBEDDED_MIS;
+        IND = EMBEDDED_INDCOH;
+        setLiveStatus("error", "FETCH FAILED · using snapshot");
+        const lu = document.getElementById("lastUpdate");
+        if (lu) lu.textContent = "Fetch error — using embedded snapshot. Check console (F12) for details.";
+      }
+    } else {
+      DATA = EMBEDDED_MIS;
+      IND = EMBEDDED_INDCOH;
+      setLiveStatus("demo", "DEMO DATA");
+      const lu = document.getElementById("lastUpdate");
+      if (lu) lu.textContent = "Embedded snapshot";
+    }
     const gs = document.getElementById("genStamp");
     if (gs) gs.textContent = new Date().toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
     const ov = document.getElementById("overlay");
